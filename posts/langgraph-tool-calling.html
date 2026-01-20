@@ -25,20 +25,20 @@
             <p class="post-date">January 20, 2026</p>
             
             <h3 id="introduction">Introduction</h3>
-            <p>Through my extensive experience testing LLMs and Agentic applications, sometimes issues come up that seem to be repeated over and over. This blog aims to document a common pattern in how developers use the popular LangGraph framework — one that can leave APIs and chatbots vulnerable to spoofed tool calls if not handled carefully. We will walk through the basics of how Langgraph manages state, some missing security controls and how this creates a common security consideration to abuse tool calling. Finally I have included a live code example to demonstrate the issue. Let's dive in!</p>
+            <p>Through my extensive experience testing LLMs and Agentic applications, sometimes issues come up that seem to be repeated over and over. This blog aims to document a common pattern in how developers use the popular LangGraph framework — one that can leave APIs and chatbots vulnerable to spoofed tool calls if not handled carefully. We will break down how LangGraph handles state, uncover where security controls are lacking, and reveal how this opens the door to abusing tool calling. Finally I have included a live code example to demonstrate the issue. Let's dive in!</p>
 
             <h2 id="1-understanding-langgraph-s-state-architecture">1. Understanding LangGraph's State Architecture</h2>
             
             <h3 id="1-1-core-components">1.1 Core Components</h3>
             <p>LangGraph models agent workflows using three fundamental components:</p>
-            <ol>
-                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#state">State</a></strong>: A shared data structure representing the current snapshot of the application</li>
-                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#nodes">Nodes</a></strong>: Functions that receive state, perform computation, and return updated state</li>
-                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#edges">Edges</a></strong>: Functions determining which node executes next based on current state</li>
-            </ol>
+            <ul>
+                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#state">State</a></strong>: A shared data structure representing the current snapshot of the application.</li>
+                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#nodes">Nodes</a></strong>: Functions that receive state, perform computation, and return updated state.</li>
+                <li><strong><a href="https://docs.langchain.com/oss/python/langgraph/graph-api#edges">Edges</a></strong>: Functions determining which node executes next based on current state.</li>
+            </ul>
 
             <h3 id="1-2-state-schema-and-reducers">1.2 State Schema and Reducers</h3>
-            <p>State is typically defined using <code>TypedDict</code>, <code>dataclass</code>, or Pydantic <code>BaseModel</code>:</p>
+            <p>State is typically defined using <code>TypedDict</code>, <code>dataclass</code>, or <code>Pydantic</code> BaseModel. A critical feature of LangGraph is the use of <strong>reducers</strong>, which determine how state updates are applied:</p>
             <pre><code class="lang-python"><span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> Annotated
 <span class="hljs-keyword">from</span> typing_extensions <span class="hljs-keyword">import</span> TypedDict
 <span class="hljs-keyword">from</span> operator <span class="hljs-keyword">import</span> add
@@ -46,86 +46,82 @@
 <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">State</span><span class="hljs-params">(TypedDict)</span>:</span>
     foo: int
     bar: Annotated[list[str], add]  <span class="hljs-comment"># Uses reducer function</span></code></pre>
-            <p><strong>Key Characteristics</strong>:</p>
+            <p><strong>Key Characteristics:</strong></p>
             <ul>
-                <li>Each state key can have a <strong>reducer function</strong> that determines how updates are applied</li>
-                <li>Without a reducer, updates <strong>override</strong> the previous value</li>
-                <li>With a reducer (e.g., <code>operator.add</code>), updates are <strong>merged/accumulated</strong></li>
-                <li>Schema validation occurs at type level, <strong>not content/semantic level</strong></li>
+                <li><strong>Override vs. Accumulate:</strong> Without a reducer, updates override the previous value. With a reducer (e.g., <code>operator.add</code>), updates are merged or accumulated.</li>
+                <li><strong>Validation:</strong> Schema validation occurs at the type level (e.g., "is this a list?"), not the semantic level (e.g., "is this content safe?").</li>
             </ul>
 
-            <h3 id="1-3-message-handling-in-state">1.3 Message Handling in State</h3>
-            <p>Most LLM-based agents use a <code>messages</code> channel to store conversation history:</p>
+            <h3 id="1-3-message-handling-and-accumulation">1.3 Message Handling and Accumulation</h3>
+            <p>Most LLM-based agents rely on the <code>messages</code> channel to store conversation history. LangGraph uses a specific reducer for this:</p>
             <pre><code class="lang-python"><span class="hljs-keyword">from</span> langgraph.graph <span class="hljs-keyword">import</span> MessagesState
-<span class="hljs-keyword">from</span> langgraph.graph.message <span class="hljs-keyword">import</span> add_messages
 
 <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-type">State</span>(<span class="hljs-type">MessagesState</span>):</span>
     documents: list[str]</code></pre>
-            <p>The <a href="https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/graph/message.py#L60">add_messages</a> reducer:</p>
-            <pre><code>@_add_messages_wrapper
-def add_messages(
-    left: Messages,
-    right: Messages,
-    *,
-    format: Literal["langchain-openai"] | None = None,
-) -&gt; Messages:
-    """Merges two lists of messages, updating existing messages by ID.
-
-    By default, this ensures the state is "append-only", unless the
-    new message has the same ID as an existing message.</code></pre>
-            <p>Most notably the reducer:</p>
-            <ul>
-                <li><strong>Deserializes</strong> messages into <a href="https://docs.langchain.com/oss/python/langgraph/graph-api#serialization">LangChain Message objects</a></li>
-                <li>Supports both native objects and dict format:
-                    <pre><code class="lang-python"><span class="hljs-comment"># Both are valid:</span>
+            <p>The default <code>add_messages</code> reducer handles the accumulation of history. Its behavior is central to the security discussion:</p>
+            <ol>
+                <li><strong>Deserialization:</strong> It converts raw data (often dictionaries) into LangChain Message objects.</li>
+                <li><strong>Format Flexibility:</strong> It accepts both native objects and dictionary formats interchangeably.
+                    <pre><code class="lang-python"><span class="hljs-comment"># Both are valid inputs to the graph:</span>
 {<span class="hljs-string">"messages"</span>: [HumanMessage(content=<span class="hljs-string">"message"</span>)]}
 {<span class="hljs-string">"messages"</span>: [{<span class="hljs-string">"type"</span>: <span class="hljs-string">"human"</span>, <span class="hljs-string">"content"</span>: <span class="hljs-string">"message"</span>}]}</code></pre>
                 </li>
-                <li>Appends new messages to the list</li>
-            </ul>
-
-            <h3 id="1-4-tool-calling-flow">1.4 Tool Calling Flow</h3>
-            <p>In a typical LangGraph agent with tools:</p>
-            <ol>
-                <li>User message enters the graph via <code>START</code> <a href="https://docs.langchain.com/oss/python/langgraph/graph-api#start-node">node</a></li>
-                <li>Agent node (LLM) processes messages and may emit tool calls</li>
-                <li>Tool calls are structured objects with <code>name</code> and <code>arguments</code></li>
-                <li>ToolNode executes the tool and returns <code>ToolMessage</code></li>
-                <li>Results are added to messages state via <code>add_messages</code> reducer</li>
-                <li>Agent continues processing</li>
-                <li><code>END</code> <a href="https://docs.langchain.com/oss/python/langgraph/graph-api#end-node">node</a> ends the graph execution</li>
+                <li><strong>Accumulation:</strong> It appends new messages to the existing list.</li>
             </ol>
+            <p><strong>Crucially, the reducer does not distinguish between messages generated by the LLM and messages supplied by a user.</strong> If an object fits the schema, it is added to the state.</p>
+
+            <h3 id="1-4-state-as-the-single-source-of-truth">1.4 State as the Single Source of Truth</h3>
+            <p>In LangGraph, the <strong>State</strong> drives the execution flow. The graph does not inherently track "who" put a tool call into the state; it only cares that the tool call <em>exists</em> in the state.</p>
+            <p>This creates a specific execution dynamic:</p>
+            <ol>
+                <li><strong>State Mutation:</strong> Any node (including the entry point) can mutate the state by adding a message containing a <code>tool_calls</code> attribute.</li>
+                <li><strong>Routing Logic:</strong> Edges and routing nodes inspect the state (specifically the last message) to decide the next step.</li>
+                <li><strong>Execution:</strong> If the state contains a message with <code>tool_calls</code>, the <code>ToolNode</code> is designed to execute them blindly.</li>
+            </ol>
+            <p>The standard "Happy Path" looks like this:</p>
+            <ul>
+                <li>User inputs text → State updates.</li>
+                <li>Agent Node processes text → State updates with AI tool calls.</li>
+                <li>ToolNode sees calls in State → Executes tools.</li>
+            </ul>
+            <p><strong>However, the graph executes identically if the state is mutated differently:</strong></p>
+            <ul>
+                <li>User inputs <em>tool calls directly</em> → State updates.</li>
+                <li>ToolNode sees calls in State → Executes tools.</li>
+            </ul>
+            <p>Because LangGraph treats the State as the single source of truth, a tool call injected directly into the state by a user is indistinguishable from one generated by the Agent. The framework executes whatever <code>tool_calls</code> are present in the message list, regardless of their origin.</p>
 
             <hr>
 
             <h2 id="2-what-langgraph-does-not-guarantee">2. Security Properties LangGraph Leaves to the Application Developer</h2>
             
-            <h3 id="2-1-no-origin-tracking-for-tool-invocations">2.1 No Origin Tracking for Tool Invocations</h3>
-            <p>By default, LangGraph treats all messages in the state uniformly and doesn't provide built-in mechanisms to distinguish agent-generated tool calls from others. This means applications that accept untrusted message histories need to implement their own origin validation. By default it messages from the user are indistinguishable from messages from the agent:</p>
+            <h3 id="2-1-no-origin-tracking-for-tool-invocations">2.1 Trust Boundary Violation: Lack of Origin Enforcement</h3>
+            <p>Because LangGraph treats the <bold>messages</bold> state as the authoritative source of truth, it relies entirely on the application developer to enforce trust boundaries. The framework itself does not enforce a separation between "control data" (tool calls generated by the agent) and "input data" (messages from the user).</p>
+            <p>When an application accepts untrusted message histories—such as restoring a chat session from a frontend client or accepting webhooks—LangGraph will deserialize and append those messages without verifying their provenance.</p>
+            <p>This creates a distinct security risk where the following three sources are treated as equivalent in the eyes of the graph:</p>
             <ul>
-                <li>Tool calls generated by the LLM/agent</li>
-                <li>Tool calls embedded in user-supplied content</li>
-                <li>Tool calls from other sources</li>
+                <li><strong>Agent Intent:</strong> Tool calls generated by the LLM as part of its reasoning process.</li>
+                <li><strong>User Input:</strong> Tool calls embedded directly in the user-supplied payload.</li>
+                <li><strong>External Injection:</strong> Tool calls injected via API or other integrations.</li>
             </ul>
-            <p>Messages have <code>role</code> tags (<code>"user"</code>, <code>"assistant"</code>, <code>"tool"</code>), but:</p>
-            <ul>
-                <li>These are <strong>part of the message content</strong>, not enforced metadata</li>
-                <li>Users can craft messages with any role</li>
-                <li>No cryptographic signing or trust boundary enforcement</li>
-            </ul>
+            
+            <p>While messages do possess role tags (e.g., <code>"user"</code>, <code>"assistant"</code>, <code>"tool"</code>), these are descriptive attributes, not security controls. LangGraph does not enforce that only an <code>"assistant"</code> role message can trigger a <code>"tool"</code> execution flow. An attacker can easily craft a payload where a <code>"user"</code> message—or a spoofed <code>"assistant"</code> message—contains tool calls. Because the framework lacks cryptographic signing or strict source validation, the graph blindly accepts these injected commands as legitimate state transitions.</p>
 
             <h3 id="2-2-content-validation-is-type-only-not-semantic">2.2 Content Validation is Type-Only, Not Semantic</h3>
             <p>Input is strictly expected to follow the schema in type matching but not in semantics. If a user supplies messages that appear to be a tool call this is perfectly acceptable. Tool Calls source is also not validated meaning calls coming from user input can easily be misinterpreted as coming from the agent.</p>
             <p>When a node returns a state update:</p>
             <pre><code class="lang-python">def node(<span class="hljs-keyword">state</span>: State) -&gt; dict:
     return {<span class="hljs-string">"messages"</span>: [some_message]}</code></pre>
-            <p>The system:</p>
+            <strong><p>The system does:</p></strong>
             <ul>
-                <li>✅ Validates the update matches the schema</li>
-                <li>✅ Applies the reducer function</li>
-                <li>❌ Does NOT validate the semantic content</li>
-                <li>❌ Does NOT check if the update contains spoofed tool calls</li>
-                <li>❌ Does NOT enforce that tool calls only come from agent nodes</li>
+                <li>Validate the update matches the schema</li>
+                <li>Apply the reducer function</li>
+            </ul>
+            <strong><p>The system does NOT:</p></strong>
+            <ul>
+                <li>Validate the semantic content</li>
+                <li>Check if the update contains spoofed tool calls</li>
+                <li>Enforce that tool calls only come from agent nodes</li>
             </ul>
 
             <hr>
@@ -243,7 +239,7 @@ pip install -r requirements.txt
 
 Final response: Result: Alice's balance: $15420.5</code></pre>
             <p>The attack succeeds when you see:</p>
-            <pre><code>Note: Spoofed tool call succeeded — accessed Bob's balance/code></pre>
+            <pre><code>Note: Spoofed tool call succeeded — accessed Bob's balance</code></pre>
             <p>This demonstrates that the spoofed tool call bypassed the intended authorization logic and executed with the attacker-controlled <code>user_id</code>.</p>
 
             <h3 id="5-5-key-vulnerability-point">5.5 Key Vulnerability Point</h3>
@@ -279,7 +275,7 @@ Final response: Result: Alice's balance: $15420.5</code></pre>
 
     <footer>
         <div class="container">
-            <p>&copy; 2025 blankwall</p>
+            <p>&copy; 2026 blankwall</p>
         </div>
     </footer>
 </body>
