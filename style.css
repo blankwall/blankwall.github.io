@@ -319,6 +319,19 @@ article img {
     margin: 2rem 0;
 }
 
+article blockquote {
+    margin: 1.5rem 0;
+    padding: 1rem 1.5rem;
+    border-left: 4px solid var(--accent);
+    background-color: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+article blockquote p {
+    margin-bottom: 0;
+}
+
 /* Code Blocks */
 code {
     background-color: var(--code-bg);
@@ -327,6 +340,42 @@ code {
     font-family: 'Monaco', 'Courier New', monospace;
     font-size: 0.9em;
     color: var(--text-primary);
+}
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    background-color: var(--bg-secondary);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+thead {
+    background-color: var(--bg-elevated);
+    border-bottom: 2px solid var(--border);
+}
+
+th {
+    padding: 1rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+td {
+    padding: 1rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+}
+
+tr:last-child td {
+    border-bottom: none;
+}
+
+tbody tr:hover {
+    background-color: var(--bg-elevated);
 }
 
 pre {

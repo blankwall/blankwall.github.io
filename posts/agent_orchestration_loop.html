@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What Do UFC Fighting, ML, and Agentic Loops Have in Common? - blankwall</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <a href="../index.html">blankwall</a>
+            </div>
+            <div class="nav-links">
+                <a href="../index.html">Home</a>
+                <a href="../about.html">About</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <article>
+            <h1>What Do UFC Fighting, ML, and Agentic Loops Have in Common?</h1>
+            <p class="post-date">March 1, 2026</p>
+
+            <p>To the astute observer, you already see where this is going.</p>
+
+            <p>I've been building a machine learning-based UFC prediction engine for a while now. At some point I had a slightly curious idea:</p>
+
+            <blockquote>
+                <p>What happens if I plug a self-improving agentic loop into the system? Can it improve the model with nothing but an initial goal?</p>
+            </blockquote>
+
+            <p>No hand-holding. No human-in-the-loop nudging. Just: <strong>"Here's the objective. Improve it."</strong></p>
+
+            <p>That question turned into a full architecture experiment.</p>
+
+            <a href="https://github.com/blankwall/ufc_ml_agents/tree/main/agent_loop">TL;DR here is the code</a>
+
+            <hr>
+            <br>
+
+            <h2 id="the-stack-and-why-it-s-not-the-interesting-part-">The Stack (And Why It's Not the Interesting Part)</h2>
+
+            <p>The core ML stack is standard: Python, XGBoost, structured datasets, held-out evaluation. Nothing exotic.</p>
+
+            <p>The interesting part is orchestration.</p>
+
+            <p>Specifically:</p>
+            <ul>
+                <li>Do you actually need LangGraph, Crew, or Claude Skills to build serious multi-agent systems?</li>
+                <li>What if you're paying for Claude Code, but <em>not</em> unlimited inference?</li>
+                <li>How do you maximize autonomy without blowing your budget?</li>
+            </ul>
+
+            <p>For me, the answer was surprisingly simple:</p>
+
+            <p><strong>Use the Claude CLI in non-interactive mode and treat agents as short-lived executors.</strong></p>
+
+            <pre><code class="lang-python">cmd = [
+    self.cfg.agent_command,               # path to claude code cli
+    "--print",                            # non-interactive mode
+    "--output-format", "json",
+    "--dangerously-skip-permissions",     # skips interactive confirmations
+    "--model", self.cfg.agent_model,
+]</code></pre>
+
+            <p>(There's also a --permission-mode acceptEdits variant I use in some runs so it can write files like plan.json or change.json without stopping to ask "are you sure?" every time.)</p>
+
+            <p>And honestly… that's pretty much the whole trick.</p>
+
+            <p>No sprawling orchestration framework to learn and debug. No long-lived agent processes chewing up RAM. No fragile in-memory conversation graph trying to keep track of who said what three hours earlier.</p>
+
+            <p>Just a clean handoff: one carefully crafted prompt finishes, drops its output into a file (a plan.json, a change.json, whatever), the next prompt picks up exactly where it left off by reading that file, and the chain keeps moving forward.</p>
+
+            <p>It's almost stupidly straightforward. But once the prompts are tuned right, it turns out to be incredibly cheap to run, completely inspectable (every step leaves a paper trail on disk), and way more reliable than most of the fancier setups I tried.</p>
+
+            <hr>
+            <br>
+
+            <h2 id="the-core-pattern-plan-implement-test-debug">The Core Pattern: Plan → Implement → Test → Debug</h2>
+
+            <p>Almost any technical problem can be decomposed into:</p>
+            <ol>
+                <li><strong>Plan</strong></li>
+                <li><strong>Implement</strong></li>
+                <li><strong>Test</strong></li>
+                <li><strong>Debug</strong></li>
+                <li>Repeat</li>
+            </ol>
+
+            <p>Once you formalize that loop, you don't need magic. You need structure.</p>
+
+            <p>Here's the system at a high level:</p>
+
+            <img src="../images/agent_flow.png" alt="Agent orchestration flow diagram">
+
+            <p>The key constraint: <strong>the LLM never evaluates itself.</strong></p>
+
+            <p>The model proposes a change.<br>A deterministic Python pipeline rebuilds the dataset, retrains XGBoost, computes held-out metrics, and emits structured JSON.</p>
+
+            <p>The agent only reads the numbers and decides: improve or revert.</p>
+
+            <p>Reasoning is probabilistic and evaluation is deterministic.</p>
+
+            <hr>
+            <br>
+
+            <h2 id="architecture-principles">Architecture Principles</h2>
+
+            <h3 id="1-role-separated-micro-agents">1. Role-Separated Micro-Agents</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Agent</th>
+                        <th>Responsibility</th>
+                        <th>Intent</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Planning</td>
+                        <td>Define optimization hypothesis → <code>plan.json</code></td>
+                        <td>Set direction</td>
+                    </tr>
+                    <tr>
+                        <td>Feature Creator</td>
+                        <td>Propose ONE scoped mutation</td>
+                        <td>Constrain change surface</td>
+                    </tr>
+                    <tr>
+                        <td>Validator</td>
+                        <td>Schema/syntax checks</td>
+                        <td>Fail fast</td>
+                    </tr>
+                    <tr>
+                        <td>Tester</td>
+                        <td>Compare deterministic metrics</td>
+                        <td>Separate proposer from judge</td>
+                    </tr>
+                    <tr>
+                        <td>Summarizer</td>
+                        <td>Produce iteration audit report</td>
+                        <td>Traceability</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>Proposers never evaluate themselves.</strong></p>
+
+            <hr>
+            <br>
+
+            <h3 id="2-deterministic-execution-boundary">2. Deterministic Execution Boundary</h3>
+
+            <p>The LLM suggests changes.</p>
+
+            <p>Python owns truth.</p>
+
+            <pre><code>LLM → Suggest feature change
+    ↓
+Python → Rebuild dataset
+        → Train XGBoost (fixed params)
+        → Compute held-out metrics
+        → Emit structured JSON
+    ↓
+LLM → Compare metrics
+      → Keep or revert</code></pre>
+
+            <p>The model does not compute its own score, separating reasoning from evaluation.</p>
+
+            <hr>
+            <br>
+
+            <h3 id="3-durable-artifact-based-state">3. Durable Artifact-Based State</h3>
+
+            <p>Each run creates:</p>
+
+            <pre><code>agent_artifacts/&lt;timestamp&gt;/
+├── plan.json
+├── history.json
+├── iter_n/
+│   ├── change.json
+│   ├── analysis.json
+│   ├── decision.json
+│   └── plan_next.json
+├── kept_changes/
+└── backups/</code></pre>
+
+            <p>Properties:</p>
+            <ul>
+                <li>Fully reproducible</li>
+                <li>Resume or forkable</li>
+                <li>Every mutation reversible</li>
+                <li>Explicit, inspectable state</li>
+            </ul>
+
+            <p>All state is kept outside of the context allowing agents to pick it up cleanly on the next iteration.</p>
+
+            <hr>
+
+            <h2 id="preventing-data-leakage-fight-mode-">Preventing Data Leakage (Fight Mode)</h2>
+
+            <p>When analyzing a specific fight:</p>
+            <ul>
+                <li>The fight is <strong>not added to the database</strong></li>
+                <li>Only historical fighter data is used</li>
+                <li>The model trains on existing data</li>
+                <li>The fight remains strictly out-of-sample</li>
+            </ul>
+
+            <p>This prevents leakage when analyzing and improving for fights that are outside of the trained data set.</p>
+
+            <hr>
+
+            <h2 id="lessons-learned">Lessons Learned</h2>
+
+            <h3 id="1-deterministic-evaluation-model-intelligence">1. Deterministic Evaluation &gt; Model Intelligence</h3>
+
+            <p>Most failures weren't because the model was "dumb."</p>
+
+            <p>They were because success criteria were vague.</p>
+
+            <p>If you don't define improvement precisely, the agent will optimize noise. If you let the model evaluate itself, it will hallucinate gains.</p>
+
+            <p>The fix was simple and non-negotiable:</p>
+            <ul>
+                <li>Evaluation happens in deterministic Python.</li>
+                <li>Metrics are computed outside the LLM.</li>
+                <li>The LLM reads structured numeric output and compares deltas.</li>
+                <li>Success criteria are explicit and machine-readable.</li>
+            </ul>
+
+            <pre><code class="lang-json">{
+  "success_criteria": {
+    "required_improvements": [
+      {"segment": "underdog", "metric": "roi", "min_delta": 0.02}
+    ]
+  }
+}</code></pre>
+
+            <p>Reasoning is probabilistic. Evaluation must not be.</p>
+
+            <hr>
+            <br>
+
+            <h3 id="2-structure-beats-cleverness">2. Structure Beats Cleverness</h3>
+
+            <p>Agent systems fail when roles blur and memory drifts.</p>
+
+            <p>Single agents reinforce their own hypotheses. Long conversations degrade constraints. Large mutations destroy interpretability. No rollback means invisible error accumulation.</p>
+
+            <p>The solution wasn't more intelligence — it was more structure:</p>
+            <ul>
+                <li>Role separation (proposer ≠ evaluator)</li>
+                <li>One logical mutation per iteration</li>
+                <li>Automatic rollback</li>
+                <li>Filesystem-backed state</li>
+                <li>Fresh agent invocation every time</li>
+            </ul>
+
+            <p>Kill conversational memory. Keep explicit artifacts.</p>
+
+            <p>Autonomy isn't about smarter agents. It's about tighter boundaries.</p>
+
+            <hr>
+            <br>
+
+            <h2 id="why-ufc-">Why UFC?</h2>
+
+            <p>Because fighting is iterative.</p>
+
+            <p>Game plan → Execute → Adjust → Repeat.</p>
+
+            <p>You don't rewrite your entire strategy mid-fight. You make one adjustment. You test it immediately. You keep it or abandon it.</p>
+
+            <p>The agent loop mirrors that.</p>
+
+            <hr>
+            <br>
+
+            <h2 id="generalizing-the-pattern">Generalizing the Pattern</h2>
+
+            <p>This architecture isn't about UFC.</p>
+
+            <p>It applies anywhere iterative improvement exists:</p>
+            <ul>
+                <li>Pentesting — propose exploit, validate externally</li>
+                <li>Code modification — propose patch, run tests</li>
+                <li>System tuning — propose config, benchmark</li>
+            </ul>
+
+            <p>The pattern holds:</p>
+            <ul>
+                <li>Separate reasoning from execution</li>
+                <li>Make evaluation deterministic</li>
+                <li>Keep state explicit</li>
+                <li>Allow rollback</li>
+                <li>Enforce role boundaries</li>
+            </ul>
+
+            <hr>
+            <br>
+
+            <h2 id="final-thought">Final Thought</h2>
+
+            <p>Most "agent" systems fail because they blur boundaries:</p>
+            <ul>
+                <li>Memory becomes implicit.</li>
+                <li>Evaluation becomes subjective.</li>
+                <li>Roles collapse.</li>
+                <li>Drift accumulates.</li>
+            </ul>
+
+            <p>The system that worked was boringly disciplined.</p>
+
+            <p>The LLM proposes. The system measures. The loop decides.</p>
+
+            <p>UFC, ML, agentic systems — same pattern:</p>
+
+            <p>Small adjustments. Objective feedback. Relentless iteration.</p>
+
+            <p>That's it.</p>
+            <a href="https://github.com/blankwall/ufc_ml_agents/tree/main/agent_loop">Code</a>
+
+        </article>
+
+        <div style="margin-top: 3rem; padding-top: 2rem; border-top: 1px solid var(--border);">
+            <a href="../blog.html">← Back to all posts</a>
+        </div>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 blankwall</p>
+        </div>
+    </footer>
+</body>
+</html>
