@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Finding root helpers on macOS, inspecting LaunchDaemons, and connecting to an OpenVPN helper's Unix socket from an ordinary user account.">
+    <title>Part 1: Recon — Finding Root Helpers on macOS - blankwall</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <a href="../index.html">blankwall</a>
+            </div>
+            <div class="nav-links">
+                <a href="../index.html">Home</a>
+                <a href="../about.html">About</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <article>
+            <h1>Part 1: Recon — Finding Root Helpers on macOS</h1>
+            <p class="post-date"><time datetime="2026-11-16">November 16, 2026</time></p>
+
+            <p>Sitting in a hotel room with an older Mac I had been travelling with, I wondered what I would look at if I wanted to get root access. This series follows that investigation, starting with identifying root helpers and their communication endpoints. Root on macOS is not all-powerful. Additional protections include <a href="https://support.apple.com/en-us/102149">System Integrity Protection</a> and <a href="https://support.apple.com/en-ie/guide/security/secddd1d86a6/web">Transparency, Consent, and Control</a>, which I’ll cover separately.</p>
+
+            <h2 id="test-environment">Test Environment</h2>
+            <p><em>This investigation was performed on an Apple Silicon Mac running macOS 15.3 (build 24D60), with OpenVPN Connect 3.6.0 (build 5410) installed. The ovpnhelper binary was associated with installer receipts for 3.6.0-5410. I did not establish a separate helper-specific version number.</em></p>
+            <p><em>These observations apply to that installation, not every OpenVPN or macOS version.</em></p>
+
+            <h2 id="identifying-root-applications">Identifying Root Applications</h2>
+            <p>First order of business was to look in common places to identify potential root applications that may contain vulnerabilities. I wanted to identify third-party applications that were installed on my system and how I could communicate with them.</p>
+            <p>I listed running processes and looked for an effective <code>UID</code> of 0. Here, <code>ruid</code> is the real UID and <code>uid</code> is the effective UID. I was interested in processes whose effective UID was 0.</p>
+            <pre><code class="language-bash">ps -axo pid=,ppid=,ruid=,uid=,comm=</code></pre>
+            <p>One process of interest this exposed:</p>
+            <pre><code>  647     1     0     0 /Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper</code></pre>
+
+            <p>Next I checked locally installed <a href="https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html">LaunchDaemons</a>. Their plist files identify the executable and any configured user. System LaunchDaemons default to root unless another user is specified.</p>
+            <pre><code class="language-bash">ls -lha  /Library/LaunchDaemons/</code></pre>
+            <pre><code>-rw-r--r--   1 root  wheel   586B Dec 13  2024 org.openvpn.client.plist
+-rw-r--r--   1 root  wheel   485B Dec 13  2024 org.openvpn.helper.plist</code></pre>
+
+            <p>The plist omits the <code>UserName</code> field, meaning this system daemon is configured to launch as root.</p>
+            <pre><code class="language-bash">plutil -p /Library/LaunchDaemons/org.openvpn.helper.plist</code></pre>
+            <pre><code>{
+  "KeepAlive" =&gt; 1
+  "Label" =&gt; "org.openvpn.helper"
+  "ProgramArguments" =&gt; [
+    0 =&gt; "/Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper"
+  ]
+  "RunAtLoad" =&gt; 1
+  "SessionCreate" =&gt; 1
+}</code></pre>
+
+            <p>I checked the helper’s launchd registration:</p>
+            <pre><code class="language-bash">launchctl print system/org.openvpn.helper</code></pre>
+            <p>excerpt:</p>
+            <pre><code>system/org.openvpn.helper = {
+    path = /Library/LaunchDaemons/org.openvpn.helper.plist
+    type = LaunchDaemon
+    state = running
+    program = /Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper
+    domain = system
+    pid = 647
+    ...
+}</code></pre>
+
+            <p>This confirmed the executable and running process. It did not show declared Mach services or sockets. A daemon can create its own communication endpoint after starting, so their absence here did not rule out communication.</p>
+            <p>Next I listed <code>/var/run/</code>, looking for root-owned Unix sockets that might belong to these processes.</p>
+            <pre><code class="language-bash">ls -lha /var/run/</code></pre>
+            <pre><code>srwxrwxrwx   1 root         daemon          0B Oct  3 11:50 ovpnhelper_service.sock</code></pre>
+            <p>The socket name suggested a connection to OpenVPN. The socket's filesystem permissions suggested that an unprivileged process could attempt a connection, but the server's own authorization logic remained unknown. Next I wanted to see whether my ordinary user account could connect.</p>
+
+            <h2 id="scripting">Scripting</h2>
+            <p>I consolidated these checks into a small throwaway tool to automate the enumeration. <a href="https://github.com/blankwall/blankwall.github.io/blob/main/scripts/root_helpers.py">root_helpers.py</a> collects root processes, LaunchDaemon configurations, and communication endpoints worth investigating. Below is a condensed excerpt showing its output for OpenVPN.</p>
+            <pre><code>$ python3 root_helpers.py
+
+OpenVPN helper
+  Executable: /Library/Frameworks/OVPNHelper.framework/
+              Versions/Current/usr/sbin/ovpnhelper
+  Observed running as root
+  File permissions: -rwxr-xr-x, root-owned
+  LaunchDaemon: org.openvpn.helper
+
+Selected root-owned socket node:
+  srwxrwxrwx /var/run/ovpnhelper_service.sock
+  Not yet attributed to a process by this inventory
+</code></pre>
+
+            <h2 id="connecting">Connecting</h2>
+            <pre><code class="language-python">import socket
+import struct
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.settimeout(3)
+    connection.connect("/var/run/ovpnhelper_service.sock")
+    # macOS: SOL_LOCAL = 0, LOCAL_PEERPID = 2
+    peer_pid = struct.unpack("i", connection.getsockopt(0, 2, 4))[0]
+    print(f"Connected to PID {peer_pid}; no request sent.")</code></pre>
+
+            <p>The snippet printed <code>Connected to PID 647; no request sent.</code> Success. I then checked the process behind that PID:</p>
+            <pre><code>ps -p 647 -o pid=,uid=,comm=
+  647     0 /Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper</code></pre>
+            <p>My ordinary-user Python process could connect to the socket. The peer-PID check confirmed the endpoint belonged to the OpenVPN helper running as root. Connecting did not elevate my process or prove that privileged requests would succeed. Next I needed to understand what requests the helper accepted and how it handled them. I will dig into that in the next blog in this series.</p>
+
+            <h2 id="protection">Protection</h2>
+            <p>Allowing an ordinary user to connect is not necessarily a vulnerability. A privileged helper exists to perform work for less-privileged clients. The important question is how it identifies callers and authorizes their requests. System-provided caller identity and code-signing requirements can help restrict access, but the helper still needs to validate each operation and its inputs.</p>
+
+            <h2 id="wrapping-up">Wrapping up</h2>
+            <p>I had identified a root-owned helper, discovered its communication socket, and established a connection from an ordinary user account.</p>
+            <p>That wasn't a vulnerability by itself. It was an attack surface worth investigating.</p>
+            <p>In Part 2, I'll reverse engineer the helper's communication protocol, trace how it handles incoming requests, and demonstrate the privilege boundary failure that ultimately allowed command execution as root.</p>
+        </article>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 blankwall</p>
+        </div>
+    </footer>
+</body>
+</html>
