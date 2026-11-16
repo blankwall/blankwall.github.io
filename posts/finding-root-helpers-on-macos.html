@@ -72,7 +72,7 @@
             <p>Next I listed <code>/var/run/</code>, looking for root-owned Unix sockets that might belong to these processes.</p>
             <pre><code class="language-bash">ls -lha /var/run/</code></pre>
             <pre><code>srwxrwxrwx   1 root         daemon          0B Oct  3 11:50 ovpnhelper_service.sock</code></pre>
-            <p>The socket name suggested a connection to OpenVPN. The socket's filesystem permissions suggested that an unprivileged process could attempt a connection, but the server's own authorization logic remained unknown. Next I wanted to see whether my ordinary user account could connect.</p>
+            <p>The socket name suggested a connection to OpenVPN and the socket's filesystem permissions hitned that an unprivileged process could attempt a connection, but the server's own authorization logic remained unknown. Next I wanted to see whether my ordinary user account could connect.</p>
 
             <h2 id="scripting">Scripting</h2>
             <p>I consolidated these checks into a small throwaway tool to automate the enumeration. <a href="https://github.com/blankwall/blankwall.github.io/blob/main/scripts/root_helpers.py">root_helpers.py</a> collects root processes, LaunchDaemon configurations, and communication endpoints worth investigating. Below is a condensed excerpt showing its output for OpenVPN.</p>
