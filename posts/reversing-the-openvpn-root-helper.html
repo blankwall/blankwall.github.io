@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Using nm and angr to reverse OpenVPN's macOS root helper from an unauthenticated Unix socket to a shell command injection boundary in popen().">
+    <title>Part 2: Reversing the OpenVPN Root Helper - blankwall</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <a href="../index.html">blankwall</a>
+            </div>
+            <div class="nav-links">
+                <a href="../index.html">Home</a>
+                <a href="../about.html">About</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <article>
+            <h1>Part 2: Reversing the OpenVPN Root Helper</h1>
+            <p class="post-date"><time datetime="2026-11-20">November 20, 2026</time></p>
+
+            <p>In <a href="finding-root-helpers-on-macos.html">Part 1</a>, I found OpenVPN's <code>ovpnhelper</code> running as root under PID 647 and confirmed that my normal user account could connect to <code>/var/run/ovpnhelper_service.sock</code>. Connecting did not prove there was a bug. Next I needed to see what the helper actually did, how clients talked to it, and whether it checked who was connecting.</p>
+
+            <h2 id="test-environment">Test Environment</h2>
+            <p><em>This analysis was performed on the same Apple Silicon Mac running macOS 15.3 (build 24D60), with OpenVPN Connect 3.6.0 (build 5410) installed. I analyzed <code>/Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper</code> (<code>SHA-256: 286271935efeaeac715c5ddd285b170cfdd23386c990983e2832074af00d9ea2</code>) with <code>angr</code> 10.0.5, and also looked statically at the ARM64 helper from OpenVPN Connect 3.8.2 (build 6009) for comparison.</em></p>
+
+            <h2 id="checking-symbols">Checking Symbols</h2>
+            <p>Many release binaries strip function names before shipping, leaving only raw addresses. Before loading a decompiler, I ran <code>nm</code> to see if readable C++ symbols were still in the binary.</p>
+            <pre><code class="language-bash">nm --demangle /Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper \
+  | grep -E "allow_client|GetRoutes|ListApps|DPCRequestHandler|callToRpc|execCommand"</code></pre>
+            <pre><code>00000001000329cc t ServerListener::allow_client(openvpn::AsioPolySock::Base&amp;)
+000000010000797c T GetRoutes()
+000000010000c4c0 t ListAppsHandler::process(...)
+000000010000db9c t DPCRequestHandler::DPCRequestHandler()
+000000010000e330 t DPCRequestHandler::process(...)
+0000000100007240 T callToRpc(...)
+0000000100007118 T execCommand(std::__1::basic_string&lt;...&gt; const&amp;, int&amp;)</code></pre>
+            <p>The binary was not stripped. Those function names gave away the basic layout right away. <code>ovpnhelper</code> runs a small local HTTP server over <code>/var/run/ovpnhelper_service.sock</code>, sets up routes in <code>GetRoutes()</code>, and has helper functions underneath named <code>callToRpc</code> and <code>execCommand</code>.</p>
+
+            <h2 id="checking-caller-validation">Checking Caller Validation</h2>
+            <p><code>ServerListener::allow_client</code> looked like the function that decides whether a connecting process is allowed to talk to the helper. On macOS, this is where you would expect a root helper to verify the caller's code signature so only the real OpenVPN app can send requests.</p>
+            <p>I used <a href="https://github.com/angr/angr">angr</a> to load the binary and print the ARM64 instructions for <code>allow_client</code>:</p>
+            <pre><code class="language-python">import angr
+
+BINARY = "/Library/Frameworks/OVPNHelper.framework/Versions/Current/usr/sbin/ovpnhelper"
+project = angr.Project(BINARY, auto_load_libs=False, load_debug_info=False)
+
+block = project.factory.block(0x1000329cc, size=8)
+for insn in block.capstone.insns:
+    print(f"{insn.address:#x}: {insn.mnemonic} {insn.op_str}")</code></pre>
+            <pre><code>0x1000329cc: mov w0, #1
+0x1000329d0: ret</code></pre>
+            <p>On ARM64, <code>w0</code> holds the return value. Putting <code>1</code> into <code>w0</code> and returning is the compiled version of:</p>
+            <pre><code class="language-cpp">bool ServerListener::allow_client(...) {
+    return true;
+}</code></pre>
+            <p>It does not check the caller at all. Any local program that connects to the socket is accepted.</p>
+
+            <h2 id="talking-http-over-the-socket">Talking HTTP Over the Socket</h2>
+            <p>Looking at <code>GetRoutes()</code> (<code>0x10000797c</code>) showed two HTTP <code>POST</code> routes: <code>/list-apps</code> and <code>/dpc-request</code>.</p>
+            <p>To test the server from my normal user account, I updated the Python socket script from Part 1 to send a <code>POST /list-apps</code> request with an empty <code>{}</code> JSON body:</p>
+            <pre><code class="language-python">import socket
+
+request = (
+    b"POST /list-apps HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    b"Content-Type: application/json\r\n"
+    b"Content-Length: 2\r\n"
+    b"Connection: close\r\n\r\n"
+    b"{}"
+)
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+    conn.settimeout(10)
+    conn.connect("/var/run/ovpnhelper_service.sock")
+    conn.sendall(request)
+    response = b"".join(iter(lambda: conn.recv(4096), b"")).decode("utf-8")
+    print(response)</code></pre>
+            <p>The root helper answered with <code>200 OK</code> and a full JSON list of installed applications and installer receipts, without needing any auth header, token, or app signature. Here is the response trimmed to the OpenVPN entries:</p>
+            <pre><code class="language-http">HTTP/1.1 200 OK
+Server: ovpnhelper_service
+Date: Wed, 18 Nov 2026 03:47:08 UTC
+Content-Type: application/json
+Content-Length: 11275
+Connection: close
+
+{
+  "error": false,
+  "list": {
+    ...
+    "OpenVPN Connect": "3.6.0",
+    "OpenVPN Uninstaller": "0.1",
+    "org.openvpn.client.pkg": "3.6.0-5410",
+    "org.openvpn.helper_framework.pkg": "3.6.0-5410",
+    "org.openvpn.helper_launch.pkg": "3.6.0-5410",
+    ...
+  }
+}</code></pre>
+
+            <h2 id="what-the-helper-does">What the Helper Does</h2>
+            <p><code>/list-apps</code> only reads installed package info, so I moved on to <code>/dpc-request</code>, handled by <code>DPCRequestHandler</code>.</p>
+            <p>DPC stands for Device Posture Check. When you connect to a corporate VPN, the VPN server can ask the client to check the state of the machine before allowing access. Looking at <code>DPCRequestHandler::DPCRequestHandler()</code> (<code>0x10000db9c</code>), the helper registers six checks:</p>
+            <ol>
+                <li><code>antivirus</code> checks running processes for antivirus software</li>
+                <li><code>disk_encryption</code> checks whether FileVault is enabled</li>
+                <li><code>client_info</code> collects basic macOS and host info</li>
+                <li><code>certificate</code> looks up client certificates</li>
+                <li><code>epki_certificate</code> looks up external PKI certificates</li>
+                <li><code>epki_signature</code> signs data using a certificate's private key</li>
+            </ol>
+            <p>The first three check system state and run directly inside the <code>ovpnhelper</code> root process.</p>
+            <p>The last three need access to the logged-in user's macOS Keychain. Because <code>ovpnhelper</code> runs as a root LaunchDaemon in the background system session, it is separate from the logged-in user's session. To work around that, the helper spawns a child process inside the target user's session using <code>launchctl asuser &lt;uid&gt;</code>.</p>
+
+            <h2 id="decompiling-dpc-request-with-angr">Decompiling <code>/dpc-request</code> with angr</h2>
+            <p>To trace how <code>/dpc-request</code> processes input, I wrote a short <code>angr</code> script to build a control-flow graph and decompile individual functions into C-like pseudocode:</p>
+            <pre><code class="language-python">import angr
+
+def decompile_function(binary_path: str, start: int, end: int) -&gt; str:
+    # Fresh Project per function avoids CFG truncation on larger C++ methods
+    project = angr.Project(binary_path, auto_load_libs=False, load_debug_info=False)
+    cfg = project.analyses.CFGFast(
+        regions=[(start, end)],
+        function_starts=[start],
+        start_at_entry=False,
+        normalize=True,
+        data_references=True,
+        resolve_indirect_jumps=True,
+    )
+    func = cfg.kb.functions[start]
+    dec = project.analyses.Decompiler(func, cfg=cfg.model)
+    return dec.codegen.text</code></pre>
+            <p>Running that on <code>DPCRequestHandler::process</code> (<code>0x10000e330</code>) showed how incoming JSON is checked and dispatched:</p>
+            <pre><code class="language-c">// Excerpt from angr decompilation of DPCRequestHandler::process (0x10000e330)
+DPC_API::setCommonResponseFields(a2, &amp;v31);
+if (!(DPC_API::validateJSON(a2, &amp;v31) &amp; 1)) {
+    sub_10000fc6c(a0, &amp;v31, v53, v52);
+    return sub_100010f48(&amp;v31);
+}
+DPC_API::Request::fromJSON(a2);
+if (!(DPC_API::validateRequest(&amp;v19, &amp;v31) &amp; 1)) {
+    ...
+}
+...
+// Walk the 6 registered posture checks (64 bytes per entry)
+i = a0-&gt;field_10;
+if (a0-&gt;field_10 != a0-&gt;field_18) {
+    do {
+        Json::Value::Value(&amp;v6, 0);
+        sub_100010040(a0, i, &amp;v19, a2, &amp;v6); // DPCRequestHandler::processSingleFunction
+        sub_100010228(&amp;v18, &amp;v6);
+        i += 64;
+    } while (i != a0-&gt;field_18);
+}</code></pre>
+            <p><code>validateJSON</code> and <code>validateRequest</code> verify that the request body is valid JSON with a few required header fields:</p>
+            <pre><code class="language-json">{
+  "ver": "1.0",
+  "correlation_id": "request-123",
+  "timestamp": 1730000000,
+  "user_id": "501"
+}</code></pre>
+            <p>Once a request passes that check, the loop walks the six registered checks and calls <code>processSingleFunction</code> on each entry. When it reaches the certificate checks, it passes the request to <code>callToRpc</code>.</p>
+
+            <h2 id="finding-the-bug">Finding the Bug</h2>
+            <p>Next I decompiled <code>callToRpc</code> (<code>0x100007240</code>) and <code>execCommand</code> (<code>0x100007118</code>).</p>
+            <p>Here is the relevant section from <code>callToRpc</code>:</p>
+            <pre><code class="language-c">// Excerpt from angr decompilation of callToRpc (0x100007240)
+Json::StreamWriterBuilder::StreamWriterBuilder(&amp;v11);
+...
+Json::writeString(&amp;v11, arg_2); // serializes JSON object back to a string
+sub_100009dc4(&amp;v12);            // gets path to the current ovpnhelper binary
+...
+sub_100358d00();                // formats the shell command string
+execCommand(&amp;v22, &amp;v3);         // executes the command string</code></pre>
+            <p>And here is <code>execCommand</code>:</p>
+            <pre><code class="language-c">// Excerpt from angr decompilation of execCommand (0x100007118)
+v6 = _popen();
+if (v6)
+{
+    while (1)
+    {
+        if (!_fgets(&amp;v0, 128, v6))
+            break;
+        std::__1::basic_string&lt;...&gt;::append(v5, &amp;v0, _strlen(&amp;v0));
+    }
+    v10 = _pclose(v6);
+    ...
+}</code></pre>
+            <p><code>angr</code> missed the arguments passed into <code>sub_100358d00()</code> and <code>_popen()</code>, so I checked the disassembly around <code>0x10000742c</code> to see what strings were loaded into registers. Right before calling <code>execCommand</code>, <code>callToRpc</code> loads this template:</p>
+            <pre><code>launchctl asuser '{}' '{}' --rpc '{}' --rpc-json '{}'</code></pre>
+            <p>Putting the pseudocode and disassembly together, those two functions are doing the equivalent of:</p>
+            <pre><code class="language-cpp">// Simplified C++ view of callToRpc and execCommand
+std::string json_text = Json::writeString(builder, request_json);
+
+std::string command = fmt::format(
+    "launchctl asuser '{}' '{}' --rpc '{}' --rpc-json '{}'",
+    user_id,      // from request JSON (or current user)
+    helper_path,  // /Library/Frameworks/.../ovpnhelper
+    rpc_name,     // e.g. "DPC_API::processCertificate"
+    json_text     // serialized request JSON
+);
+
+FILE* pipe = popen(command.c_str(), "r");</code></pre>
+            <p>That is the bug.</p>
+            <p><code>Json::writeString</code> formats a JSON object as text. Because JSON strings use double quotes (<code>"..."</code>), the serializer escapes double quotes (<code>\"</code>), and leaves single quotes (<code>'</code>) untouched. <code>callToRpc</code> then places that JSON string inside single quotes (<code>'...'</code>) and hands the whole command string to <code>popen()</code>.</p>
+            <p><code>popen()</code> passes the string to <code>/bin/sh -c</code>. Even though the command is trying to run <code>launchctl asuser</code>, <code>ovpnhelper</code> is running as root, so <code>/bin/sh</code> starts as root first to parse the command line. If a field in the JSON contains a single quote (<code>'</code>), <code>/bin/sh</code> treats it as the end of the <code>--rpc-json</code> argument and executes whatever comes next as UID 0.</p>
+
+            <h2 id="confirming-root-execution">Confirming Root Execution</h2>
+            <p>To verify this on my machine without making lasting changes, I sent a test request from my normal user account (<code>UID 501</code>) that ran <code>ps</code> inside the spawned shell and deleted its temporary output file right after. I left the exploit payload out of this post, and here is what the canary recorded:</p>
+            <pre><code>PID     PPID    EUID    RUID    COMMAND
+22201   647     0       0       sh</code></pre>
+            <p><code>PPID 647</code> is the <code>ovpnhelper</code> daemon from Part 1, and <code>PID 22201</code> is <code>/bin/sh</code> running with real and effective <code>UID 0</code>.</p>
+
+            <h2 id="protection">Protection</h2>
+            <p>To see how newer versions handle this path, I downloaded OpenVPN Connect 3.8.2 (build 6009) and inspected its ARM64 <code>ovpnhelper</code> binary (<code>SHA-256: c3ac312b9eec74f963ae366826c132620b9ccd97edec8192db2bd90967e4a3d2</code>) statically in <code>angr</code> without installing it.</p>
+            <p>In build 6009, <code>callToRpc</code> removes <code>/bin/sh</code> and <code>popen()</code> from this path. It checks <code>user_id</code> and the handler name against strict regular expressions, passes an argument array directly to <code>posix_spawn</code>, and sends the JSON over <code>stdin</code>:</p>
+            <pre><code class="language-cpp">// Conceptual view of the build 6009 launch path (static analysis only)
+// user_id checked against ^[0-9]{1,10}$
+// rpc_name checked against ^[A-Za-z_][A-Za-z0-9_:]{0,127}$
+
+const char* argv[] = {
+    "/bin/launchctl", "asuser", user_id.c_str(),
+    helper_path.c_str(), "--rpc", rpc_name.c_str(), nullptr
+};
+
+spawnAndCapture("/bin/launchctl", argv, json_text); // json_text written to stdin</code></pre>
+            <p>Without a shell parsing the command string, quotes inside the JSON are just plain bytes on <code>stdin</code>.</p>
+            <p>More generally, root helpers on macOS have two boundaries to protect. First, the helper should verify who is connecting using system-provided caller identity and code-signing checks instead of returning <code>true</code> for every local socket client. Second, privileged code should avoid passing client data into <code>popen()</code> or <code>system()</code> when <code>posix_spawn</code> can run the target binary directly.</p>
+
+            <h2 id="wrapping-up">Wrapping up</h2>
+            <p>In Part 1, basic enumeration commands and a short Python script showed that my user account could connect to OpenVPN's root helper over <code>/var/run/ovpnhelper_service.sock</code>. In Part 2, <code>nm</code> and <code>angr</code> showed what sat behind that socket: an unauthenticated local HTTP server that passed JSON input into a single-quoted <code>popen()</code> command running as root.</p>
+        </article>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 blankwall</p>
+        </div>
+    </footer>
+</body>
+</html>
